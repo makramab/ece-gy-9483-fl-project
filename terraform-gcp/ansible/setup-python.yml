@@ -1,0 +1,54 @@
+---
+- name: Provision Python & FL dependencies
+  hosts: all
+  become: yes
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install build tools & Python prerequisites
+      apt:
+        name:
+          - build-essential
+          - software-properties-common
+          - libssl-dev
+          - zlib1g-dev
+          - libbz2-dev
+          - libreadline-dev
+          - libsqlite3-dev
+          - libffi-dev
+          - liblzma-dev
+          - python3-venv
+          - python3-pip
+        state: present
+
+    - name: Create virtualenv
+      command: python3 -m venv /opt/fl-env
+      args:
+        creates: /opt/fl-env/bin/activate
+
+    - name: Ensure venv directory is owned by the SSH user
+      file:
+        path: /opt/fl-env
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        recurse: yes
+
+    - name: Upgrade pip in the venv
+      pip:
+        virtualenv: /opt/fl-env
+        name: pip
+        state: latest
+
+    - name: Copy requirements.txt
+      copy:
+        src: requirements.txt
+        dest: /opt/fl-env/requirements.txt
+        mode: '0644'
+
+    - name: Install Python libraries
+      pip:
+        requirements: /opt/fl-env/requirements.txt
+        virtualenv: /opt/fl-env

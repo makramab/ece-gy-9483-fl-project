@@ -1,0 +1,21 @@
+---
+plugin: gcp_compute             # the plugin name (must match the filename minus “.py”)
+collections:
+  - google.cloud                # tells Ansible to look in the google.cloud collection
+projects:
+  - CHANGE_TO_YOUR_PROJECT_NAME # your GCP project
+auth_kind: application          # use ADC (gcloud auth application-default)
+zones:
+  - us-east1-b
+  - us-west1-b
+filters:
+  - status = RUNNING            # only include running instances
+
+# Make each VM’s external IP the SSH target, and pin the Python interpreter:
+compose:
+  ansible_host: networkInterfaces[0].accessConfigs[0].natIP
+  ansible_python_interpreter: /usr/bin/python3.12
+
+# Use the GCE “name” field as the inventory_hostname
+hostnames:
+  - name

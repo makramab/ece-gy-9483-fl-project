@@ -1,0 +1,15 @@
+# Terraform directories and files
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+crash.log
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Ignore any override variable files (if you ever use them)
+*.tfvars
+*.tfvars.json
+
+# Lock file is safe to commit, so we don't ignore .terraform.lock.hcl
