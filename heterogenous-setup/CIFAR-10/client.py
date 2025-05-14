@@ -8,13 +8,12 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split
 import argparse
 import pickle
-import time
 
-# ==== Models ====
+# === Model Definitions ===
 class BasicLinear(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc = nn.Linear(784, 10)
+        self.fc = nn.Linear(3 * 32 * 32, 10)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
@@ -23,7 +22,7 @@ class BasicLinear(nn.Module):
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(784, 256)
+        self.fc1 = nn.Linear(3 * 32 * 32, 256)
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 64)
         self.fc4 = nn.Linear(64, 32)
@@ -40,11 +39,11 @@ class MLP(nn.Module):
 class LeNet5(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 6, 5, padding=2)
+        self.conv1 = nn.Conv2d(3, 6, 5, padding=2)
         self.pool1 = nn.AvgPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
         self.pool2 = nn.AvgPool2d(2, 2)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc1 = nn.Linear(16 * 6 * 6, 120)
         self.fc2 = nn.Linear(120, 84)
         self.fc3 = nn.Linear(84, 10)
 
@@ -58,14 +57,21 @@ class LeNet5(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
-# ==== Data ====
+# === Quantization Utilities ===
+def quantize(tensor, num_bits=8):
+    qmin, qmax = -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1
+    scale = tensor.abs().max() / qmax
+    quantized = torch.clamp((tensor / scale).round(), qmin, qmax)
+    return quantized, scale
+
+# === Data Loader ===
 def get_dataloaders(client_id):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
-    full_train = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    test = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    full_train = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    test = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
 
     public_size = 10000
     private_size = len(full_train) - public_size
@@ -74,95 +80,84 @@ def get_dataloaders(client_id):
     splits[2] += private_size % 3
     private_sets = random_split(private_data, splits)
 
-    client_loader = DataLoader(private_sets[client_id - 1], batch_size=64, shuffle=True)
-    public_loader = DataLoader(public_data, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test, batch_size=64, shuffle=False)
-    return client_loader, public_loader, test_loader
+    return (
+        DataLoader(private_sets[client_id - 1], batch_size=64, shuffle=True),
+        DataLoader(public_data, batch_size=64, shuffle=True),
+        DataLoader(test, batch_size=64, shuffle=False)
+    )
 
-# ==== Evaluation ====
 def evaluate(model, loader, device):
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for inputs, labels in loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, preds = outputs.max(1)
-            total += labels.size(0)
-            correct += (preds == labels).sum().item()
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            preds = model(x).argmax(1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
     return correct / total
 
-# ==== Client Logic ====
+# === Main Client Logic ===
 def run_client(client_id, server_ip):
-    torch.manual_seed(10)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model_cls = [BasicLinear, MLP, LeNet5][client_id - 1]
-    model = model_cls().to(device)
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    model = model_cls().to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     distill_criterion = nn.KLDivLoss(reduction="batchmean")
 
     client_loader, public_loader, test_loader = get_dataloaders(client_id)
-
     context = zmq.Context()
     socket = context.socket(zmq.DEALER)
     socket.setsockopt(zmq.IDENTITY, f"client{client_id}".encode())
     socket.connect(f"tcp://{server_ip}:5555")
 
-    num_rounds = 10
-    local_epochs = 1
-    distill_temperature = 3
-
-    for rnd in range(1, num_rounds + 1):
-        print(f"\n[Client {client_id}] Round {rnd} - Training")
+    for rnd in range(1, 11):
+        print(f"\n[Client {client_id}] Round {rnd} - Local Training")
         model.train()
-        for _ in range(local_epochs):
-            for x, y in client_loader:
-                x, y = x.to(device), y.to(device)
-                optimizer.zero_grad()
-                out = model(x)
-                loss = criterion(out, y)
-                loss.backward()
-                optimizer.step()
+        for x, y in client_loader:
+            x, y = x.to(model.fc1.weight.device), y.to(model.fc1.weight.device)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
 
-        acc = evaluate(model, test_loader, device)
+        acc = evaluate(model, test_loader, model.fc1.weight.device)
         print(f"[Client {client_id}] Accuracy before distill: {acc*100:.2f}%")
 
-        print(f"[Client {client_id}] Sending logits to server")
-        public_inputs, _ = next(iter(public_loader))
-        public_inputs = public_inputs.to(device)
-        logits = model(public_inputs)
+        # Public inference
+        x_pub, _ = next(iter(public_loader))
+        x_pub = x_pub.to(model.fc1.weight.device)
+        logits = model(x_pub).detach().cpu()
+        q_logits, scale = quantize(logits)
 
-        msg = {
+        socket.send_multipart([b"", pickle.dumps({
             "client_id": client_id,
-            "logits": logits.detach().cpu(),
+            "quantized_logits": q_logits,
+            "scale": scale,
             "round": rnd
-        }
-        socket.send_multipart([b"", pickle.dumps(msg)])
+        })])
 
-        # Wait for teacher signal
         _, reply = socket.recv_multipart()
-        data = pickle.loads(reply)
-        teacher_prob = data["teacher_prob"].to(device)
+        teacher_logits = pickle.loads(reply)["teacher_logits"].to(model.fc1.weight.device)
 
+        # Distillation phase
         model.train()
+        s_logits = model(x_pub)
+        loss_distill = distill_criterion(
+            F.log_softmax(s_logits / 3, dim=1),
+            F.softmax(teacher_logits / 3, dim=1)
+        )
         optimizer.zero_grad()
-        student_log_prob = F.log_softmax(logits / distill_temperature, dim=1)
-        loss_distill = distill_criterion(student_log_prob, teacher_prob)
         loss_distill.backward()
         optimizer.step()
 
-        print(f"[Client {client_id}] Distillation done.")
-        acc = evaluate(model, test_loader, device)
+        acc = evaluate(model, test_loader, model.fc1.weight.device)
         print(f"[Client {client_id}] Accuracy after distill: {acc*100:.2f}%")
 
-
+# === CLI ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--client_id", type=int, required=True, help="1 for BasicLinear, 2 for MLP, 3 for LeNet5")
-    parser.add_argument("--server_ip", type=str, required=True, help="Server IP address")
+    parser.add_argument("--client_id", type=int, required=True, help="1=Linear, 2=MLP, 3=LeNet5")
+    parser.add_argument("--server_ip", type=str, required=True)
     args = parser.parse_args()
     run_client(args.client_id, args.server_ip)
-
-
