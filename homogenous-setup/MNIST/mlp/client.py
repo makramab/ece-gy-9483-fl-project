@@ -1,143 +1,112 @@
-import sys
+import zmq
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
-import torchvision.transforms as T
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, random_split
+import argparse
+import pickle
 
-import flwr as fl
-from flwr.client import NumPyClient
-from flwr_datasets import FederatedDataset
-from flwr_datasets.partitioner import IidPartitioner
-
-# Flower server address (replace with actual server IP)
-SERVER_ADDRESS = "<server_ip>:8080"
-
-# 𝚃ransform pipeline: PIL → Tensor + normalize
-transform = T.Compose([
-    T.ToTensor(),
-    T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-])
-
-# Custom collate_fn to apply transform and stack into batches
-def collate_fn(batch):
-    images = [transform(example["img"]) for example in batch]
-    labels = [example["label"] for example in batch]
-    return torch.stack(images), torch.tensor(labels)
-
-
-# Define model
-class Net(nn.Module):
+class MLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool  = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1   = nn.Linear(16 * 5 * 5, 120)
-        self.fc2   = nn.Linear(120, 84)
-        self.fc3   = nn.Linear(84, 10)
+        self.fc1 = nn.Linear(784, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.fc4 = nn.Linear(64, 32)
+        self.fc5 = nn.Linear(32, 10)
 
     def forward(self, x):
-        x = self.pool(torch.relu(self.conv1(x)))
-        x = self.pool(torch.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        return self.fc5(x)
 
+def quantize(tensor, num_bits=8):
+    qmin = -2 ** (num_bits - 1)
+    qmax = 2 ** (num_bits - 1) - 1
+    scale = tensor.abs().max() / qmax
+    return torch.clamp((tensor / scale).round(), qmin, qmax), scale
 
-# Convert between PyTorch state_dict and Flower’s parameters
-def get_parameters(model: nn.Module, config):
-    return [val.cpu().numpy() for _, val in model.state_dict().items()]
+def get_dataloaders(client_id):
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+    full_train = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    test = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
 
-def set_parameters(model: nn.Module, parameters):
-    state_dict = model.state_dict()
-    for (key, _), param in zip(state_dict.items(), parameters):
-        state_dict[key] = torch.tensor(param)
-    model.load_state_dict(state_dict)
+    public_size = 10000
+    private_size = len(full_train) - public_size
+    private_data, public_data = random_split(full_train, [private_size, public_size])
+    splits = [private_size // 3] * 3
+    splits[2] += private_size % 3
+    private_sets = random_split(private_data, splits)
 
-
-# Local train & test routines
-def train(net, loader):
-    net.train()
-    optimizer = optim.Adam(net.parameters())
-    loss_fn = nn.CrossEntropyLoss()
-    for images, labels in loader:
-        optimizer.zero_grad()
-        outputs = net(images)
-        loss_fn(outputs, labels).backward()
-        optimizer.step()
-
-def test(net, loader):
-    net.eval()
-    loss_fn = nn.CrossEntropyLoss()
-    total_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for images, labels in loader:
-            outputs = net(images)
-            total_loss += loss_fn(outputs, labels).item()
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-    return total_loss / len(loader), correct / total
-
-
-# Flower client
-class FLClient(NumPyClient):
-    def __init__(self, cid: str):
-        self.cid = int(cid)
-
-        # Partition CIFAR-10 train split into 2 IID shards
-        fds = FederatedDataset(
-            dataset="cifar10",
-            partitioners={"train": IidPartitioner(num_partitions=2)},
-            shuffle=True,
-            seed=42,
-        )
-
-        # Load this client’s training partition
-        train_ds = fds.load_partition(partition_id=self.cid)
-        self.trainloader = DataLoader(
-            train_ds,
-            batch_size=32,
-            shuffle=True,
-            collate_fn=collate_fn,
-        )
-
-        # Load the shared test split
-        test_ds = fds.load_split("test")
-        self.testloader = DataLoader(
-            test_ds,
-            batch_size=32,
-            collate_fn=collate_fn,
-        )
-
-        # Initialize the model
-        self.net = Net()
-
-    # Accept the extra `config` parameter
-    def get_parameters(self, config):
-        return get_parameters(self.net, config)
-
-    def fit(self, parameters, config):
-        set_parameters(self.net, parameters)
-        train(self.net, self.trainloader)
-        return get_parameters(self.net, config), len(self.trainloader.dataset), {}
-
-    def evaluate(self, parameters, config):
-        set_parameters(self.net, parameters)
-        loss, accuracy = test(self.net, self.testloader)
-        return float(loss), len(self.testloader.dataset), {"accuracy": float(accuracy)}
-
-
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python3 flower_client.py <client_id>")
-        sys.exit(1)
-
-    client_id = sys.argv[1]
-    fl.client.start_numpy_client(
-        server_address=SERVER_ADDRESS,
-        client=FLClient(client_id),
+    return (
+        DataLoader(private_sets[client_id - 1], batch_size=64, shuffle=True),
+        DataLoader(public_data, batch_size=64, shuffle=True),
+        DataLoader(test, batch_size=64, shuffle=False)
     )
 
+def evaluate(model, loader, device):
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            correct += (model(x).argmax(1) == y).sum().item()
+            total += y.size(0)
+    return correct / total
+
+def run_client(client_id, server_ip):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MLP().to(device)
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    criterion = nn.CrossEntropyLoss()
+    distill_criterion = nn.KLDivLoss(reduction="batchmean")
+
+    client_loader, public_loader, test_loader = get_dataloaders(client_id)
+    context = zmq.Context()
+    socket = context.socket(zmq.DEALER)
+    socket.setsockopt(zmq.IDENTITY, f"client{client_id}".encode())
+    socket.connect(f"tcp://{server_ip}:5555")
+
+    for rnd in range(1, 11):
+        print(f"\n[Client {client_id}] Round {rnd}")
+        model.train()
+        for x, y in client_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
+
+        acc = evaluate(model, test_loader, device)
+        print(f"[Client {client_id}] Accuracy before distill: {acc*100:.2f}%")
+
+        x_pub, _ = next(iter(public_loader))
+        x_pub = x_pub.to(device)
+        logits = model(x_pub).detach().cpu()
+        q_logits, scale = quantize(logits)
+
+        socket.send_multipart([b"", pickle.dumps({"client_id": client_id, "quantized_logits": q_logits, "scale": scale, "round": rnd})])
+        _, reply = socket.recv_multipart()
+        teacher_logits = pickle.loads(reply)["teacher_logits"].to(device)
+
+        optimizer.zero_grad()
+        s_logits = model(x_pub)
+        loss_distill = distill_criterion(F.log_softmax(s_logits / 3, dim=1), F.softmax(teacher_logits / 3, dim=1))
+        loss_distill.backward()
+        optimizer.step()
+
+        acc = evaluate(model, test_loader, device)
+        print(f"[Client {client_id}] Accuracy after distill: {acc*100:.2f}%")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client_id", type=int, required=True)
+    parser.add_argument("--server_ip", type=str, required=True)
+    args = parser.parse_args()
+    run_client(args.client_id, args.server_ip)
