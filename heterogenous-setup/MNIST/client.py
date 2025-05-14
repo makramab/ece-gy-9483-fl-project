@@ -8,17 +8,15 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split
 import argparse
 import pickle
-import time
 
-# ==== Models ====
+# === Model Definitions ===
 class BasicLinear(nn.Module):
     def __init__(self):
         super().__init__()
         self.fc = nn.Linear(784, 10)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+        return self.fc(x.view(x.size(0), -1))
 
 class MLP(nn.Module):
     def __init__(self):
@@ -58,7 +56,13 @@ class LeNet5(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
-# ==== Data ====
+# === Quantization Utilities ===
+def quantize(tensor, num_bits=8):
+    qmin, qmax = -2 ** (num_bits - 1), 2 ** (num_bits - 1) - 1
+    scale = tensor.abs().max() / qmax
+    return torch.clamp((tensor / scale).round(), qmin, qmax), scale
+
+# === Data ===
 def get_dataloaders(client_id):
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -74,30 +78,26 @@ def get_dataloaders(client_id):
     splits[2] += private_size % 3
     private_sets = random_split(private_data, splits)
 
-    client_loader = DataLoader(private_sets[client_id - 1], batch_size=64, shuffle=True)
-    public_loader = DataLoader(public_data, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test, batch_size=64, shuffle=False)
-    return client_loader, public_loader, test_loader
+    return (
+        DataLoader(private_sets[client_id - 1], batch_size=64, shuffle=True),
+        DataLoader(public_data, batch_size=64, shuffle=True),
+        DataLoader(test, batch_size=64, shuffle=False)
+    )
 
-# ==== Evaluation ====
 def evaluate(model, loader, device):
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for inputs, labels in loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, preds = outputs.max(1)
-            total += labels.size(0)
-            correct += (preds == labels).sum().item()
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            correct += (model(x).argmax(1) == y).sum().item()
+            total += y.size(0)
     return correct / total
 
-# ==== Client Logic ====
+# === Main Client Logic ===
 def run_client(client_id, server_ip):
-    torch.manual_seed(10)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model_cls = [BasicLinear, MLP, LeNet5][client_id - 1]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model_cls().to(device)
     optimizer = optim.SGD(model.parameters(), lr=0.01)
     criterion = nn.CrossEntropyLoss()
@@ -110,59 +110,51 @@ def run_client(client_id, server_ip):
     socket.setsockopt(zmq.IDENTITY, f"client{client_id}".encode())
     socket.connect(f"tcp://{server_ip}:5555")
 
-    num_rounds = 10
-    local_epochs = 1
-    distill_temperature = 3
-
-    for rnd in range(1, num_rounds + 1):
+    for rnd in range(1, 11):
         print(f"\n[Client {client_id}] Round {rnd} - Training")
         model.train()
-        for _ in range(local_epochs):
-            for x, y in client_loader:
-                x, y = x.to(device), y.to(device)
-                optimizer.zero_grad()
-                out = model(x)
-                loss = criterion(out, y)
-                loss.backward()
-                optimizer.step()
+        for x, y in client_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
 
         acc = evaluate(model, test_loader, device)
         print(f"[Client {client_id}] Accuracy before distill: {acc*100:.2f}%")
 
-        print(f"[Client {client_id}] Sending logits to server")
-        public_inputs, _ = next(iter(public_loader))
-        public_inputs = public_inputs.to(device)
-        logits = model(public_inputs)
+        x_pub, _ = next(iter(public_loader))
+        x_pub = x_pub.to(device)
+        logits = model(x_pub).detach().cpu()
+        q_logits, scale = quantize(logits)
 
-        msg = {
+        socket.send_multipart([b"", pickle.dumps({
             "client_id": client_id,
-            "logits": logits.detach().cpu(),
+            "quantized_logits": q_logits,
+            "scale": scale,
             "round": rnd
-        }
-        socket.send_multipart([b"", pickle.dumps(msg)])
+        })])
 
-        # Wait for teacher signal
         _, reply = socket.recv_multipart()
-        data = pickle.loads(reply)
-        teacher_prob = data["teacher_prob"].to(device)
+        teacher_logits = pickle.loads(reply)["teacher_logits"].to(device)
 
         model.train()
+        s_logits = model(x_pub)
+        loss_distill = distill_criterion(
+            F.log_softmax(s_logits / 3, dim=1),
+            F.softmax(teacher_logits / 3, dim=1)
+        )
         optimizer.zero_grad()
-        student_log_prob = F.log_softmax(logits / distill_temperature, dim=1)
-        loss_distill = distill_criterion(student_log_prob, teacher_prob)
         loss_distill.backward()
         optimizer.step()
 
-        print(f"[Client {client_id}] Distillation done.")
         acc = evaluate(model, test_loader, device)
         print(f"[Client {client_id}] Accuracy after distill: {acc*100:.2f}%")
 
-
+# === CLI ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--client_id", type=int, required=True, help="1 for BasicLinear, 2 for MLP, 3 for LeNet5")
-    parser.add_argument("--server_ip", type=str, required=True, help="Server IP address")
+    parser.add_argument("--client_id", type=int, required=True, help="1=Linear, 2=MLP, 3=LeNet5")
+    parser.add_argument("--server_ip", type=str, required=True)
     args = parser.parse_args()
     run_client(args.client_id, args.server_ip)
-
-
