@@ -98,4 +98,9 @@ Results are logged per round, including:
 - Aggregated model accuracy
 - Quantization error (for knowledge distillation setup)
 
+## Authors
+- M. Akram Bari
+- Jason Widjaja
+- Riya Shah
+
 
